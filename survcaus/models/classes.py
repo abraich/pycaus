@@ -1,0 +1,1677 @@
+import json
+import matplotlib.pyplot as plt
+import neptune.new as neptune
+import numpy as np
+import numpy.random as nr
+# search hyperparameter
+import optuna
+import pandas as pd
+import seaborn as sns
+import torch  # For building the networks
+import torch.nn as nn
+import torch.nn.functional as F
+from neptune.new.types import File
+from numba import jit
+from numpy.random import binomial, multivariate_normal
+from scipy.integrate import simps
+from scipy.linalg.special_matrices import toeplitz
+from scipy.stats import gaussian_kde
+from scipy.stats.stats import mode
+from sklearn import preprocessing
+from sklearn.manifold import TSNE
+from sklearn.model_selection import ShuffleSplit
+from tqdm import tqdm
+
+from apps.surv_files.losses import *
+from apps.surv_files.simulationnew import *
+from apps.surv_files.utils import *
+
+scaler = preprocessing.MinMaxScaler()
+
+
+args_cuda = False  # torch.cuda.is_available()
+
+
+"""
+Model architecture
+"""
+
+
+class NetCFRSurv(nn.Module):
+
+    def __init__(self, in_features, encoded_features, out_features, alpha=1):
+        super().__init__()
+
+        self.psi = nn.Sequential(
+            nn.Linear(in_features-1, 32),  nn.LeakyReLU(),
+            nn.Linear(32, 32),  nn.ReLU(),
+            nn.Linear(32, 28),  nn.LeakyReLU(),
+            nn.Linear(28, encoded_features),
+        )
+
+        self.surv_net = nn.Sequential(
+            nn.Linear(encoded_features + 1, 128), nn.LeakyReLU(),
+            nn.Linear(128, 128),
+            nn.LeakyReLU(),
+            nn.Linear(128, 50),  nn.ReLU(),
+            nn.Linear(50, out_features),
+        )
+
+        self.alpha = alpha
+        self.loss_surv = NLLPMFLoss()  # NLLLogistiHazardLoss()
+        self.loss_wass = WassLoss()  # IPM
+
+    def forward(self, input):
+        """
+        The forward function takes the input and computes the output of the network.
+        The output is computed by applying a linear transformation to the input, then
+        applying a logistic sigmoid activation function. The computation is done in one
+        line of code!
+
+            Args:
+                x (Tensor): Input tensor with shape (batch_size, num_features)
+
+            Returns:
+                y (Tensor): Output tensor with shape (batch_size, 1)
+
+        :param self: Used to access the variables and methods of the class.
+        :param input: Used to pass the input data.
+        :return: the output of the network, which is a tensor containing the values of (t)$ for each time step.
+
+        """
+        x, t = get_data(input)
+        self.input = input
+        psi = self.psi(x)
+        # psi_inv = self.psi_inv(psi)
+        psi_t = torch.cat((psi, t), 1)
+        phi = self.surv_net(psi_t)
+        return phi, psi_t
+
+    def get_repr(self, input):
+        x, t = get_data(input)
+        return torch.cat((self.psi(x), t), 1)
+
+    def predict(self, input):
+        """
+        The predict function returns the predicted class for a single data point.
+
+        Args:
+            input (numpy.array): A representation of a piece of data in numpy array format.  This can be in either image or vector format, so long as the function is able to accept it as input and operate on it!  If you are using images, this will be an array consisting of 3 subarrays, each containing the R G B values for each pixel location.
+
+        :param self: Used to access the attributes and methods of the class in python.
+        :param input: Used to pass the input data to the function.
+        :return: the inner product of the input and the weight vector.
+
+        :doc-author: Trelent
+        """
+        psi_t = self.get_repr(input)
+        return self.surv_net(psi_t)
+
+
+# define the model
+""" DataLoader class """
+is_tcga = False
+is_support = False
+is_metabric = True
+
+
+class DataLoader():
+    def __init__(self, params_sim, params_survcaus):
+        super().__init__()
+        self.path = params_sim['path_data']
+        self.pmf = True
+        self.scheme_subd = "equidistant"  # "quantiles"  # "equidistant"  # "quantiles"
+        self.num_durations = params_survcaus['num_durations']
+
+    def load_data_sim_benchmark(self):
+        """
+        The load_data_sim_benchmark function loads the simulated data from the csv file and splits it into training, validation, and test sets.
+        The function also transforms the labels to a more usable format for our purposes.
+
+        :param self: Used to reference the object that is being created.
+        :return: the following:.
+
+        :doc-author: Trelent
+        """
+        if is_tcga:
+            self.path = './final_data_1_simu'
+        if is_support:
+            self.path = './support_simu'
+        if is_metabric:
+            self.path = './metabric_simu'
+
+        df = pd.read_csv(self.path + ".csv")
+        dim = df.shape[1]-8
+
+        x_z_list = ["X" + str(i) for i in range(1, dim + 1)] + ["tt"]
+        leave = x_z_list + ["event", "T_f_cens"]
+
+        ##
+        rs = ShuffleSplit(test_size=.4, random_state=0)
+        df_ = df[leave].copy()
+
+        for train_index, test_index in rs.split(df_):
+            df_train = df_.drop(test_index)
+            df_test = df_.drop(train_index)
+            df_val = df_test.sample(frac=0.2)
+            df_test = df_test.drop(df_val.index)
+
+        if self.pmf:
+            labtrans = PMF.label_transform(
+                self.num_durations, scheme=self.scheme_subd)
+
+        def get_target(df):
+            return (df["T_f_cens"].values, df["event"].values)
+
+        y_train_surv = labtrans.fit_transform(*get_target(df_train))
+        y_val_surv = labtrans.transform(*get_target(df_val))
+
+        train = (df_train[x_z_list].values.astype("float32"), y_train_surv)
+        val = (
+            df_val[x_z_list].values.astype("float32"),
+            y_val_surv,
+        )
+        # We don't need to transform the test labels
+        durations_test, events_test = get_target(df_test)
+        x_test = df_test[x_z_list].values.astype("float32")
+
+        # SPlit data for OURS
+        self.x_train, self.y_train, self.train, self.val,\
+            self.durations_test, self.events_test, self.labtrans, self.x_test = train[
+                0], train[1], train, val, durations_test, events_test, labtrans, x_test
+
+        #  SPlit data for benchmarking
+
+        def get_separ_data(x):
+            """
+            The get_separ_data function takes in a dataframe and returns two separate dataframes, one for the treatment group and one for the control group.
+
+            :param x: Used to separate the data into two different sets of data.
+            :return: a dataframe with the rows of x where tt = 1 and a dataframe with the rows of x where tt = 0.
+
+            """
+            mask_1 = x["tt"] == 1
+            mask_0 = x["tt"] == 0
+            x_1 = x[mask_1].drop(columns="tt")
+            x_0 = x[mask_0].drop(columns="tt")
+            return x_0, x_1
+
+        df_train_0,  df_train_1 = get_separ_data(df_train)
+        df_test_0, df_test_1 = get_separ_data(df_test)
+
+        self.x_0_train = df_train_0.iloc[:, :-2].values
+        self.e_0_train = df_train_0.iloc[:, -2].values
+
+        self.x_1_train = df_train_1.iloc[:, :-2].values
+        self.e_1_train = df_train_1.iloc[:, -2].values
+
+        self.T_f_0_train = df_train_0.iloc[:, -1].values
+        self.T_f_1_train = df_train_1.iloc[:, -1].values
+
+        self.x_0_test = df_train_0.iloc[:, :-2].values
+        self.e_0_test = df_train_0.iloc[:, -2].values
+
+        self.x_1_test = df_test_1.iloc[:, :-2].values
+        self.e_1_test = df_test_1.iloc[:, -2].values
+
+        self.T_f_0_test = df_test_0.iloc[:, -1].values
+        self.T_f_1_test = df_test_1.iloc[:, -1].values
+
+        self.df_train = df_train
+        self.df_test = df_test
+        self.df_val = df_val
+
+    def get_data(self):
+        self.load_data_sim_benchmark()
+        return self
+
+
+""" SurvCaus class """
+
+
+class SurvCaus(nn.Module):
+
+    def __init__(self, params_sim, params_survcaus):
+        super().__init__()
+
+        num_durations = params_survcaus['num_durations']
+        encoded_features = params_survcaus['encoded_features']
+        alpha_surv = 1.
+        alpha_wass = params_survcaus['alpha_wass']
+        batch_size = params_survcaus['batch_size']
+        epochs = params_survcaus['epochs']
+        lr = params_survcaus['lr']
+        is_tcga = False
+        path_data = params_sim['path_data']
+        patience = params_survcaus['patience']
+
+        self.num_durations = num_durations
+        if is_tcga:
+            self.data.x_train, self.data.y_train, self.train, self.val, self.durations_test, self.events_test, self.labtrans, self.data.x_test = load_data_sim_hd(path=path_data,
+                                                                                                                                                                  num_durations=self.num_durations, pmf=True, dim=self.dim)
+        else:
+            self.data = DataLoader(
+                params_sim, params_survcaus).get_data()
+
+        self.in_features = self.data.x_train.shape[1]
+        self.encoded_features = encoded_features
+        self.out_features = self.data.labtrans.out_features
+        self.cuts = self.data.labtrans.cuts
+        self.net = NetCFRSurv(
+            self.in_features, self.encoded_features, self.out_features)
+
+        self.alpha_wass = alpha_wass
+        self.alpha_surv = alpha_surv
+        self.loss = Loss(self.alpha_wass, self.alpha_surv)
+        self.lr = lr
+        self.model = PMF(self.net, tt.optim.Adam(self.lr),
+                         duration_index=self.data.labtrans.cuts, loss=self.loss)
+        self.batch_size = batch_size
+        self.epochs = epochs
+
+        if args_cuda:
+            self.net.cuda()
+            self.loss.cuda()
+            self.model.cuda()
+        self.metrics = dict(loss_surv=Loss(0, 1), loss_wass=Loss(1, 0))
+        self.callbacks = [tt.cb.EarlyStopping(patience=patience)]
+
+    def fit_model(self, is_train=True):
+        """Fits the model on the device .
+
+        Args:
+            is_train (bool, optional): [description]. Defaults to True.
+        """
+        """if args_cuda:
+            self.data.x_train, self.data.y_train, self.data.val = self.data.x_train.cuda(
+            ), self.data.y_train.cuda(), self.data.val.cuda()"""
+        log = self.model.fit(self.data.x_train, self.data.y_train, self.batch_size,
+                             self.epochs, callbacks=self.callbacks, metrics=self.metrics, val_data=self.data.val)
+        self.log = log
+        # print('Saving model ...')
+        # pickle.dump(self.net, open(filename, 'wb'))
+
+    def res_model(self):
+        """
+        The res_model function returns the results of the model.
+
+        :param self: Used to access variables that belongs to the class.
+        :return: the log of the model.
+
+        :doc-author: Trelent
+        """
+        res = self.model.log.to_pandas()
+        self.res = res
+        p1 = res[['train_loss', 'val_loss']].plot(figsize=(16, 10))
+        p2 = res[['train_loss_surv', 'val_loss_surv']].plot(figsize=(16, 10))
+        p3 = res[['train_loss_wass', 'val_loss_wass']].plot(figsize=(16, 10))
+        return res  # ,p1,p2,p3
+
+    def wass_init(self):
+        """
+        The wass_init function takes the data from the dataset and converts it into a
+        tensor. 
+            Args: x | tt=0 and tt=1
+
+            Returns: Wasserstein distance between the two distributions.
+
+        :param self: Used to access the attributes and methods of the class.
+        :return: the representation of the data.
+
+        :doc-author: Trelent
+        """
+        x1, x0 = sepr_repr(torch.tensor(self.data.x_train).float())
+        return SinkhornDistance(eps=0.001, max_iter=100, reduction=None)(x1, x0)
+
+    """def S_pred(self, tt, x):
+        x_c = x.copy()
+        ones = np.ones_like(x[:, -1])
+        x_c[:, -1] = tt * ones + (1-tt)*(1-ones)
+        surv = self.model.predict_surv_df(x_c)
+        return surv"""
+
+    def S_pred(self, x):
+        """
+        The S_pred function takes a single vector of values and returns the
+        survival function for those values. The survival function is defined as
+        S(t) = P[T > t] where T is the time to event. This method takes an array_like
+        object, such as a numpy array or python list, and returns a new numpy array.
+
+        :param self: Used to access the attributes of the class.
+        :param x: Used to predict the survival function for x.
+        :return: the predicted survival functions for the two groups.
+
+        :doc-author: Trelent
+        """
+        ones = np.ones_like(x[:, -1])
+        x_0 = x.copy()
+        x_0[:, -1] = 0. * ones
+        x_1 = x.copy()
+        x_1[:, -1] = 1. * ones
+        surv_0, surv_1 = self.model.predict_surv_df(
+            x_0), self.model.predict_surv_df(x_1)
+        return surv_0, surv_1
+
+
+""" Evaluation class """
+
+
+class Evaluation():
+    def __init__(self, params_simu, params_survcaus):
+        self.params_simu = params_simu
+        self.params_survcaus = params_survcaus
+        self.SC = SurvCaus(self.params_simu, self.params_survcaus)
+        self.path = params_simu['path_data']
+        self.data = DataLoader(
+            self.params_simu, self.params_survcaus).get_data()
+        self.cuts = self.SC.cuts
+        self.t_max = min(max(self.data.df_train['T_f_cens']), max(self.cuts))
+
+        self.N = 500
+
+        self.coef_tt = params_simu['coef_tt']
+        self.lamb = params_simu['lamb']
+        self.alpha = params_simu['alpha']
+        self.beta = params_simu['beta']
+
+        self.scheme = params_simu['scheme']
+        self.scheme_function = params_simu['scheme'].get_scheme_function()
+        self.sheme_type = params_simu['scheme'].get_scheme_type()
+
+        times = np.linspace(0, self.t_max, self.N)
+        # get tau
+        """tau0 = quantile(times, self.S_p(self.data.x_0_train, 0, times, 0), 0.1)
+        tau1 = quantile(times, self.S_p(self.data.x_1_train, 1, times, 0), 0.1)
+        tau_min = min(tau0, tau1)
+        self.I = np.linspace(0, tau_min, self.N)"""
+        self.I = np.linspace(0, self.t_max, self.N)
+
+    """def S(self, tt_p, xbeta_p, t):
+        c_tt = self.params_simu['coef_tt'] * tt_p
+
+        if self.params_simu['scheme'] == 'linear':
+            return np.exp(-(self.params_simu['lamb'] * t) ** self.params_simu['alpha'] * np.exp(xbeta_p + c_tt))
+        else:
+            sh_z = xbeta_p + np.cos(xbeta_p + c_tt) + \
+                np.abs(xbeta_p - c_tt) + c_tt
+            return np.exp(-(self.params_simu['lamb'] * t) ** self.params_simu['alpha'] * np.exp(sh_z))
+    """
+
+    def S_p(self, x, tt, t, patient):
+        c_tt = self.coef_tt * tt
+
+        if self.sheme_type == 'linear':
+            x_beta_p = x.dot(self.beta)[patient]
+            return np.exp(-((self.lamb * t) ** self.alpha) * np.exp(x_beta_p + c_tt))
+        else:
+            sh_z = self.scheme_function(x)[patient] + c_tt
+            return np.exp(-((self.lamb * t) ** self.alpha) * np.exp(sh_z))
+
+    def S(self, x, tt, t):
+        c_tt = self.coef_tt * tt
+
+        if self.scheme == 'linear':
+            x_beta = x.dot(self.beta)
+            return np.exp(-((self.lamb * t) ** self.alpha) * np.exp(x_beta + c_tt))
+        else:
+            sh_z = self.scheme_function(x) + c_tt
+            return np.exp(-((self.lamb * t) ** self.alpha) * np.exp(sh_z))
+
+    def set_params_bart(self, params_bart):
+        self.params_bart = params_bart
+
+    def Results_SurvCaus(self, model, is_train):
+        if is_train:
+            x_ = self.data.df_train.iloc[:, :-2]
+        else:
+            x_ = self.data.df_test.iloc[:, :-2]
+
+        #cl_patient_list = x_.iloc[:, :-1].dot(self.params_simu['beta']).values
+        #S_0_pred_mat = model.S_pred(0, x_.values)
+        #S_1_pred_mat = model.S_pred(1, x_.values)
+        S_0_pred_mat, S_1_pred_mat = model.S_pred(x_.values)
+        PEHE_list = []
+        mise_0_list = []
+        mise_1_list = []
+        mise_cate_list = []
+
+        S_0_true_list = []
+        S_1_true_list = []
+        S_0_pred_list = []
+        S_1_pred_list = []
+        d = {}
+        x_ = x_.iloc[:, :-1]
+        for patient in tqdm(range(x_.shape[0])):
+
+            #xbeta = cl_patient_list[patient]
+
+            # S_0_pred_mat[patient].values.squeeze()
+            S_0_pred = S_0_pred_mat.iloc[:, patient].values.squeeze()
+            # S_1_pred_mat[patient].values.squeeze()
+            S_1_pred = S_1_pred_mat.iloc[:, patient].values.squeeze()
+
+            # S_0_pred_, S_1_pred_ = piecewise(I, S_0_pred, cuts), piecewise(I, S_1_pred, cuts)
+            S_0_pred_, S_1_pred_ = interpolate(
+                self.I, self.cuts, S_0_pred, S_1_pred)
+
+            #S_0_pred_, S_1_pred_ = piecewise(self.I, self.cuts, S_0_pred), piecewise(self.I, self.cuts, S_1_pred)
+
+            """S_0_true_, S_1_true_ = self.S(
+                0, xbeta, self.I), self.S(1, xbeta, self.I)"""
+
+            S_0_true_, S_1_true_ = self.S_p(x_.values, 0, self.I, patient), self.S_p(
+                x_.values, 1, self.I, patient)
+
+            S_0_true_list.append(S_0_true_)
+            S_1_true_list.append(S_1_true_)
+            S_0_pred_list.append(S_0_pred_)
+            S_1_pred_list.append(S_1_pred_)
+
+            CATE_true = (S_1_true_ - S_0_true_)
+            CATE_pred = (S_1_pred_ - S_0_pred_)
+
+            PEHE_list.append((CATE_true-CATE_pred)**2)
+
+            mise_0 = mise(S_0_true_, S_0_pred_, self.I)
+            mise_1 = mise(S_1_true_, S_1_pred_, self.I)
+
+            mise_cate = mise(CATE_true, CATE_pred, self.I)
+
+            mise_0_list.append(mise_0)
+            mise_1_list.append(mise_1)
+            mise_cate_list.append(mise_cate)
+
+        d['I'] = self.I
+        d['cuts'] = self.cuts.tolist()
+        d['mise_0'] = mise_0_list
+        d['mise_1'] = mise_1_list
+        d['mise_cate'] = mise_cate_list
+        d['sqrt PEHE'] = np.sqrt(np.mean(PEHE_list, axis=0))
+        d['S_0_pred'] = S_0_pred_list
+        d['S_1_pred'] = S_1_pred_list
+        d['S_0_true'] = S_0_true_list
+        d['S_1_true'] = S_1_true_list
+        return d
+
+    def Results_Benchmark(self, model0, model1, is_train):
+        """
+        The Results_Benchmark function computes the MISE, PEHE and sqrt PEHE for a given model.
+        It also computes the CATE predicted by the model and compares it to true CATE.
+        The function returns a dictionary with all these results.
+
+        :param self: Used to access variables, methods and.
+        :param model0: Used to fit the model on the training data.
+        :param model1: Used to specify the model used to predict the survival function.
+        :param is_train: Used to distinguish between the training and testing data.
+        :return: a dictionary with the following keys:.
+
+        :doc-author: Trelent
+        """
+
+        if is_train:
+            x_ = self.data.df_train.iloc[:, :-3]
+        else:
+            x_ = self.data.df_test.iloc[:, :-3]
+        d = {}
+        PEHE_list = []
+        mise_0_list = []
+        mise_1_list = []
+        mise_cate_list = []
+
+        S_0_true_list = []
+        S_1_true_list = []
+        S_0_pred_list = []
+        S_1_pred_list = []
+
+        #cl_patient_list = x_.dot(self.params_simu['beta']).values
+
+        S_0_pred_mat = model0.predict_survival(x_)
+        S_1_pred_mat = model1.predict_survival(x_)
+
+        for patient in tqdm(range(x_.shape[0])):
+
+            #cl_patient = cl_patient_list[patient]
+            S_0_pred = np.asarray(S_0_pred_mat[patient, :].flatten())
+            S_1_pred = np.asarray(S_1_pred_mat[patient, :].flatten())
+
+            #S_0_pred_ = self.piecewise_c(self.I, model0.times, S_0_pred)
+            #S_1_pred_ = self.piecewise_c(self.I, model1.times, S_1_pred)
+            #print(len(S_0_pred), len(S_1_pred), len(self.I), len(self.cuts), len(model0.times), len(model1.times))
+
+            S_0_pred_ = piecewise(self.I, model0.times, S_0_pred)
+            S_1_pred_ = piecewise(self.I, model1.times, S_1_pred)
+            """S_0_true_, S_1_true_ = self.S(
+                0,  cl_patient, self.I), self.S(1, cl_patient, self.I)"""
+
+            S_0_true_, S_1_true_ = self.S_p(x_.values, 0, self.I, patient), self.S_p(
+                x_.values, 1, self.I, patient)
+
+            S_0_true_list.append(S_0_true_)
+            S_1_true_list.append(S_1_true_)
+            S_0_pred_list.append(S_0_pred_)
+            S_1_pred_list.append(S_1_pred_)
+
+            CATE_true = S_1_true_ - S_0_true_
+            CATE_pred = S_1_pred_ - S_0_pred_
+            PEHE_list.append((CATE_true-CATE_pred)**2)
+
+            mise_0 = mise(S_0_true_, S_0_pred_, self.I)
+            mise_1 = mise(S_1_true_, S_1_pred_, self.I)
+
+            mise_cate = mise(CATE_true, CATE_pred, self.I)
+
+            mise_0_list.append(mise_0)
+            mise_1_list.append(mise_1)
+            mise_cate_list.append(mise_cate)
+
+        d['I'] = self.I.tolist()
+        d['cuts'] = self.cuts.tolist()
+        d['mise_0'] = mise_0_list
+        d['mise_1'] = mise_1_list
+        d['mise_cate'] = mise_cate_list
+        d['sqrt PEHE'] = np.sqrt(np.mean(PEHE_list, axis=0))
+        d['S_0_pred'] = S_0_pred_list
+        d['S_1_pred'] = S_1_pred_list
+        d['S_0_true'] = S_0_true_list
+        d['S_1_true'] = S_1_true_list
+
+        return d
+
+    def All_Results(self, list_models=["SurvCaus", "SurvCaus_0"], is_train=True, params_bart=None):
+        self.set_params_bart(params_bart)
+        self.list_models = list_models
+        d_list_models = {}
+        cate_dict = {}
+        surv0_dict = {}
+        surv1_dict = {}
+        pehe_dict = {}
+        fsm_dict = {}
+        bilan = {}
+        bilan['models'] = list_models
+        bilan['Mise0'] = []
+        bilan['Mise1'] = []
+        bilan['CATE'] = []
+        bilan['PEHE'] = []
+        bilan['FSM'] = []
+        for model_name in list_models:
+            print(model_name)
+            if model_name == "SurvCaus":
+                SC = SurvCaus(self.params_simu, self.params_survcaus)
+                SC.fit_model()
+                d_list_models[f'd_{model_name}'] = self.Results_SurvCaus(
+                    SC, is_train)
+                #self.SC = SC
+            if model_name == "SurvCaus_0":
+                params_survcaus_0 = self.params_survcaus.copy()
+                params_survcaus_0['alpha_wass'] = 0.
+                SC0 = SurvCaus(self.params_simu, params_survcaus_0)
+                SC0.fit_model()
+                d_list_models[f'd_{model_name}'] = self.Results_SurvCaus(
+                    SC0, is_train)
+
+            if model_name == 'BART':
+                model0, model1 = BART(num_trees=self.params_bart['num_trees']), BART(
+                    num_trees=self.params_bart['num_trees'])
+                model0.fit(X=self.data.x_0_train,
+                           T=self.data.T_f_0_train, E=self.data.e_0_train, max_features=self.params_bart[
+                               'max_features'],
+                           max_depth=self.params_bart['max_depth'], alpha=self.params_bart['alpha'])
+                model1.fit(X=self.data.x_1_train,
+                           T=self.data.T_f_1_train, E=self.data.e_1_train, max_features=self.params_bart[
+                               'max_features'],
+                           max_depth=self.params_bart['max_depth'], alpha=self.params_bart['alpha'])
+                d_list_models[f'd_{model_name}'] = self.Results_Benchmark(
+                    model0, model1, is_train)
+
+            if model_name == 'CoxPH':
+                model0, model1 = CoxPHModel(), CoxPHModel()
+                model0.fit(self.data.x_0_train, self.data.T_f_0_train,
+                           self.data.e_0_train, max_iter=2000, lr=0.1, tol=10e-3, verbose=True)
+                model1.fit(self.data.x_1_train, self.data.T_f_1_train,
+                           self.data.e_1_train, max_iter=2000, lr=0.1, tol=10e-3, verbose=True)
+                d_list_models[f'd_{model_name}'] = self.Results_Benchmark(
+                    model0, model1, is_train)
+
+            if model_name == 'DeepSurv':
+                structure = [
+                    {'activation': 'BentIdentity', 'num_units': 150}, ]
+
+                model0, model1 = NonLinearCoxPHModel(
+                    structure=structure), NonLinearCoxPHModel(structure=structure)
+
+                model0.fit(self.data.x_0_train, self.data.T_f_0_train,
+                           self.data.e_0_train, lr=1e-3, init_method='xav_uniform')
+                model1.fit(self.data.x_1_train, self.data.T_f_1_train,
+                           self.data.e_1_train, lr=1e-3, init_method='xav_uniform')
+                d_list_models[f'd_{model_name}'] = self.Results_Benchmark(
+                    model0, model1, is_train)
+
+            if model_name == 'EST':
+                model0, model1 = ExtraSurvivalTreesModel(
+                    num_trees=200), ExtraSurvivalTreesModel(num_trees=200)
+                model0.fit(self.data.x_0_train, self.data.T_f_0_train,
+                           self.data.e_0_train)
+                model1.fit(self.data.x_1_train, self.data.T_f_1_train,
+                           self.data.e_1_train)
+                d_list_models[f'd_{model_name}'] = self.Results_Benchmark(
+                    model0, model1, is_train)
+            if model_name == 'NMTLR':
+                structure = [{'activation': 'ReLU', 'num_units': 150}, ]
+                model0, model1 = NeuralMultiTaskModel(
+                    structure=structure, bins=150), NeuralMultiTaskModel(structure=structure, bins=150)
+                model0.fit(self.data.x_0_train, self.data.T_f_0_train,
+                           self.data.e_0_train, lr=1e-3, init_method='xav_uniform')
+                model1.fit(self.data.x_1_train, self.data.T_f_1_train,
+                           self.data.e_1_train, lr=1e-3, init_method='xav_uniform')
+                d_list_models[f'd_{model_name}'] = self.Results_Benchmark(
+                    model0, model1, is_train)
+
+            if model_name == 'RSF':
+                model0, model1 = RandomSurvivalForestModel(
+                    num_trees=200), RandomSurvivalForestModel(num_trees=200)
+                model0.fit(self.data.x_0_train, self.data.T_f_0_train,
+                           self.data.e_0_train)
+                model1.fit(self.data.x_1_train, self.data.T_f_1_train,
+                           self.data.e_1_train)
+                d_list_models[f'd_{model_name}'] = self.Results_Benchmark(
+                    model0, model1, is_train)
+
+            cate_dict[f'{model_name}'] = d_list_models[f'd_{model_name}']['mise_cate']
+            surv0_dict[f'{model_name}'] = d_list_models[f'd_{model_name}']['mise_0']
+            surv1_dict[f'{model_name}'] = d_list_models[f'd_{model_name}']['mise_1']
+            pehe_dict[f'{model_name}'] = d_list_models[f'd_{model_name}']['sqrt PEHE']
+            fsm_dict[f'{model_name}'] = (np.array(surv0_dict[f'{model_name}'].copy(
+            ))+np.array(surv1_dict[f'{model_name}'].copy()))/2.
+
+            bilan['CATE'].append((np.mean(cate_dict[f'{model_name}']).round(
+                3), np.std(cate_dict[f'{model_name}']).round(3)))
+            bilan['PEHE'].append((np.mean(pehe_dict[f'{model_name}']).round(
+                3), np.std(pehe_dict[f'{model_name}']).round(3)))
+            bilan['Mise0'].append((np.mean(surv0_dict[f'{model_name}']).round(
+                3), np.std(surv0_dict[f'{model_name}']).round(3)))
+            bilan['Mise1'].append((np.mean(surv1_dict[f'{model_name}']).round(
+                3), np.std(surv1_dict[f'{model_name}']).round(3)))
+            bilan['FSM'].append((np.mean(fsm_dict[f'{model_name}']).round(
+                3), np.std(fsm_dict[f'{model_name}']).round(3)))
+
+        self.bilan_benchmark = pd.DataFrame(bilan)
+        self.bilan_json = bilan
+        self.d_list_models = d_list_models
+
+        def box_plot(l, title):
+            fig, ax = plt.subplots()
+            ax.boxplot(l.values())
+            ax.set_xticklabels(l.keys())
+            # rotate and align the tick labels so they look better
+            fig.autofmt_xdate()
+            plt.title(str(title))
+            return fig
+
+        self.box_plot_cate = box_plot(cate_dict, "MISE des CATE")
+        self.box_plot_surv0 = box_plot(surv0_dict, "MISE de Surv0")
+        self.box_plot_surv1 = box_plot(surv1_dict, "MISE de Surv1")
+        self.box_plot_pehe = box_plot(pehe_dict, "sqrt PEHE")
+        self.box_plot_FSM = box_plot(fsm_dict, "FSM")
+
+    def represent_patient(self, patient):
+        for model_name in self.list_models[1:]:
+            fig_surv, fig_cate = plots(
+                patient, self.d_list_models, model_name=model_name)
+
+
+""" Tunning hyperparameter class """
+
+
+class Tunning():
+    def __init__(self, params_simu):
+        super().__init__()
+        self.params_simu = params_simu
+
+    def objective_survcaus(self, trial):
+
+        self.params_search = {'num_durations':  trial.suggest_int('num_durations', 20, 30),
+                              'encoded_features': trial.suggest_int('encoded_features', 10, 30),
+                              # trial.suggest_uniform('alpha_wass', 0, 10),
+                              'alpha_wass': trial.suggest_loguniform('alpha_wass', 1e-2, 1e-1),
+                              # 'batch_size': trial.suggest_int('batch_size', 64, 256),
+                              # 'epochs': 20,  #trial.suggest_int('epochs', 50, 200),
+                              'lr': trial.suggest_loguniform('lr', 1e-4, 1e-2)
+                              # 'patience': trial.suggest_int('patience', 2, 10)
+                              }
+        self.params_search['epochs'] = 20
+        self.params_search['patience'] = 4
+        self.params_search['batch_size'] = 256
+
+        self.SC = SurvCaus(self.params_simu, self.params_search)
+        self.Eval = Evaluation(self.params_simu, self.params_search)
+
+        self.SC.fit_model()
+        #d_train = Eval.Results_SurvCaus(SC, is_train=True)
+        d_val = self.Eval.Results_SurvCaus(self.SC, is_train=False)
+        #MMise_train = (np.mean(d_train["mise_0"])+np.mean(d_train["mise_1"]))/2
+        MMise_val = np.mean(
+            d_val["mise_cate"]) * (np.mean(d_val["mise_0"])+np.mean(d_val["mise_1"]))/2
+
+        # MMise_cate_train = np.mean(d_train["mise_cate"]).round(2)
+        # MMise_cate_val = np.mean(d_val["mise_cate"]).round(2)
+        return MMise_val  # + MMise_train
+
+    def objective_bart(self, trial):
+
+        self.params_s_bart = {'num_trees':  trial.suggest_int('num_trees', 10, 30),
+                              'max_features': trial.suggest_categorical('max_features', ['all', 'sqrt', 'log2']),
+                              'max_depth': trial.suggest_int('max_depth', 5, 10),
+                              'alpha': trial.suggest_loguniform('alpha', 0.05, 0.5)
+                              }
+
+        model0, model1 = BART(num_trees=self.params_s_bart['num_trees']), BART(
+            num_trees=self.params_s_bart['num_trees'])
+        model0.fit(X=self.Eval.data.x_0_train,
+                   T=self.Eval.data.T_f_0_train, E=self.Eval.data.e_0_train, max_features=self.params_s_bart[
+                       'max_features'],
+                   max_depth=self.params_s_bart['max_depth'], alpha=self.params_s_bart['alpha'])
+        model1.fit(X=self.Eval.data.x_1_train,
+                   T=self.Eval.data.T_f_1_train, E=self.Eval.data.e_1_train, max_features=self.params_s_bart[
+                       'max_features'],
+                   max_depth=self.params_s_bart['max_depth'], alpha=self.params_s_bart['alpha'])
+        #d_train = Eval.Results_SurvCaus(SC, is_train=True)
+        d_val = self.Eval.Results_Benchmark(model0, model1, is_train=False)
+        #MMise_train = (np.mean(d_train["mise_0"])+np.mean(d_train["mise_1"]))/2
+        MMise_val = np.mean(
+            d_val["mise_cate"]) * (np.mean(d_val["mise_0"])+np.mean(d_val["mise_1"]))/2
+
+        # MMise_cate_train = np.mean(d_train["mise_cate"]).round(2)
+        # MMise_cate_val = np.mean(d_val["mise_cate"]).round(2)
+        return MMise_val
+
+    def get_best_hyperparameter_survcaus(self, n_trials=10):
+        self.study_sc = optuna.create_study(direction='minimize')
+        self.study_sc.optimize(self.objective_survcaus, n_trials=n_trials)
+        self.params_search_sc = self.study_sc.best_params
+        return self.params_search_sc
+
+    def get_best_hyperparameter_bart(self, n_trials=10):
+        self.study_bart = optuna.create_study(direction='minimize')
+        self.study_bart.optimize(self.objective_bart, n_trials=n_trials)
+        self.params_search_bart = self.study_bart.best_params
+        return self.params_search_bart
+
+# v0
+
+
+class SimulationOld:
+
+    def __init__(self, params_simu):
+
+        n_samples = params_simu['n_samples']
+        n_features = params_simu['n_features']
+        beta = params_simu['beta']
+        alpha = params_simu['alpha']
+        lamb = params_simu['lamb']
+        kappa_cens = params_simu['kappa']
+        coef_tt = params_simu['coef_tt']
+        rho = params_simu['rho']
+        scheme = params_simu['scheme']
+        wd_para = params_simu['wd_param']
+
+        """[summary]
+        Simulation des données de survie causales. Nous controlons la distance de wasserstein entre les groupes traité/non traité
+        et le taux de censure.
+
+        Args:
+            n_samples ([integer]): [data size]
+            n_features ([integer]): [number of columns/features]
+            beta ([float]): [c'est le paramètre d'influence linéraire des colonnes]
+            alpha ([float]): [description]
+            lamb ([float]): [description]
+            kappa_cens ([float]): [description]
+            rho (float, optional): [description]. Defaults to 0.0.
+            scheme (str, optional): [description]. Defaults to 'linear'.
+            wd_para (int, optional): [description]. Defaults to 5.
+        """
+
+        self.n_features = n_features
+        """if len(beta) != n_features:
+            print("Error: n_features != len(beta) ")"""
+
+        # Simulation of baseline covariates
+        cov = toeplitz(rho ** np.arange(0, self.n_features))
+
+        # multivariate normal
+        self.X = multivariate_normal(
+            np.zeros(self.n_features), cov, size=n_samples)
+        # uniformal distribution
+        #self.X = np.random.uniform(0, 1, size=(n_samples, n_features))
+
+        self.n_samples = n_samples
+        self.beta = beta
+        self.alpha = alpha
+        self.lamb = lamb
+        self.kappa_cens = kappa_cens
+        self.coef_tt = coef_tt  # coef of treatement
+        self.scheme = scheme
+        self.wd_para = wd_para
+        self.Xbeta = self.X.dot(self.beta)
+        self.path_data = params_simu["path_data"]
+
+    # True Survival function
+
+    def S(self, xbeta_p, tt_p, t):  # Agathe : pourquoi X apparait et pas Xbeta ?
+        c_tt = self.coef_tt * tt_p  # coef_tt : coef de traitement
+
+        if self.scheme == 'linear':
+            return np.exp(-((self.lamb * t) ** self.alpha) * np.exp(xbeta_p + c_tt))
+        else:
+            sh_z = xbeta_p + np.cos(xbeta_p + c_tt) + \
+                np.abs(xbeta_p - c_tt) + c_tt
+            return np.exp(-((self.lamb * t) ** self.alpha) * np.exp(sh_z))
+
+    def S_1(self, xbeta_p, t):
+        return self.S(xbeta_p, 1, t)
+
+    def S_0(self, xbeta_p, t):
+        return self.S(xbeta_p, 0, t)
+
+    # Simulation of times to event according to a Weibull-Cox model
+    def simulation_T(self, tt):
+        c_tt = self.coef_tt * tt
+        log_u = np.log(np.random.uniform(0, 1, self.n_samples))
+
+        if self.scheme == 'linear':  # schema linéraire ens X
+            log_T = 1.0 / self.alpha * \
+                (np.log(-log_u) - (self.Xbeta + c_tt))
+        else:  # schema non linéraire en X
+            log_T = 1.0 / self.alpha * (np.log(-log_u) - (self.Xbeta + np.cos(self.Xbeta + c_tt)
+                                                          - np.abs(self.Xbeta - c_tt)
+                                                          - c_tt))
+
+        return np.exp(log_T) / self.lamb
+
+    # Simulation of times to event according an exponential distribution
+    def simulation_C(self, lamb_c):
+        log_u = np.log(np.random.uniform(0, 1, self.n_samples))
+        return -log_u / lamb_c
+
+    def simulation_surv(self):
+        # treatment simulation
+        idx = np.arange(self.n_features)
+        params_tt = (-1) ** idx * np.exp(-idx / 10.)
+
+        p_tt = sigmoid(self.X.dot(params_tt))
+        tt = binomial(1, p_tt)  # treatment
+
+        for j in range(self.n_features):
+            self.X[:, j] -= self.wd_para/2 * tt
+            self.X[:, j] += self.wd_para/2 * (1-tt)
+
+        # simulation of factual and counterfactual times to event
+        T_f = self.simulation_T(tt)
+        T_cf = self.simulation_T(1-tt)
+        mean_T_f = np.mean(T_f)
+
+        # simulation of censoring
+        C = self.simulation_C(1/(self.kappa_cens * mean_T_f))
+
+        # definition of observations
+        T_f_cens = np.minimum(T_f, C)
+        event = (T_f <= C) * 1
+
+        # definition of T1 and T0 (it matches the factual and counterfactual times to event)
+        T_1 = T_f*tt + T_cf * (1-tt)
+        T_0 = T_f*(1-tt) + T_cf * tt
+
+        # transform treatment specific covariates in tensor and compute the Wasserstein distance
+        mask_1, mask_0 = (tt == 1), (tt == 0)
+        X_tesnor = torch.tensor(self.X).float()
+        x_1 = X_tesnor[mask_1]
+        x_0 = X_tesnor[mask_0]
+        m = max(x_0.shape, x_1.shape)
+        z0 = torch.zeros(m)
+        m0 = x_0.shape[0]
+        z0[:m0, ] = x_0
+        z1 = torch.zeros(m)
+        m1 = x_1.shape[0]
+        z1[:m1, ] = x_1
+        wd = SinkhornDistance(eps=0.001, max_iter=100,
+                              reduction=None)(z0, z1).item()
+
+        # data_frame construction
+        colmns = ["X" + str(j) for j in range(1, self.n_features + 1)]
+        data_sim = pd.DataFrame(data=self.X, columns=colmns)
+
+        # scaling
+        #data_sim = pd.DataFrame(scaler.fit_transform(data_sim),columns=colmns)
+
+        data_sim["tt"] = tt
+        data_sim["T_f_cens"] = T_f_cens
+        data_sim["event"] = event
+        data_sim["T_1"] = T_1
+        data_sim["T_0"] = T_0
+
+        data_sim["T_f"] = T_f
+        data_sim["T_cf"] = T_cf
+
+        data_sim["Xbeta"] = self.Xbeta
+        self.data_sim = data_sim
+
+        # observed censoring, treatment proportions
+        self.perc_treatement = int((data_sim["tt"].mean() * 100))
+        self.perc_event = int(data_sim["event"].mean() * 100)
+        # Wasserstein distances
+        print("WD = ", wd)
+        print(f"tt = 1 : {self.perc_treatement} % ")
+        print(f"event = 1 : {self.perc_event} %")
+        self.wd = wd
+        data_sim.to_csv(self.path_data + ".csv", index=False, header=True)
+        return data_sim
+
+    # Distribution plots for tt=0/1
+
+    def plot_dist(self):
+
+        colmns = ["X" + str(j) for j in range(1, self.n_features + 1)] + ["tt"]
+        return sns.pairplot(self.data_sim[colmns], hue="tt", diag_kind="hist", height=6)
+
+    # True S_O and S_1 for a patient
+    def plot_surv_true(self, patient=1):
+
+        t_max = max(self.data_sim["T_f"])
+        times = np.linspace(0, t_max, 100)
+        """
+        indx_1 = self.S_1(0, times) >= 0.01
+        indx_0 = self.S_0(0, times) >= 0.01
+        idx_min = indx_1+indx_0
+        times = times[idx_min]"""
+
+        xbeta_p = self.Xbeta[patient]
+
+        T_0_p = self.data_sim["T_0"].values[patient].round(2)
+        T_1_p = self.data_sim["T_1"].values[patient].round(2)
+        tt_p = self.data_sim["tt"].values[patient]
+        self.S_0_true = self.S_0(xbeta_p, times)
+        self.S_1_true = self.S_1(xbeta_p, times)
+
+        fig = plt.figure(figsize=(18, 10))
+        ax = fig.add_subplot(111)
+        ax.plot(
+            times,
+            self.S_0_true,
+            label="S_true for tt=0",
+            marker="o",
+            markersize=1,
+            color="b",
+        )
+        ax.plot(
+            times,
+            self.S_1_true,
+            label="S_true for tt=1",
+            marker="o",
+            markersize=1,
+            color="r",
+        )
+        ax.vlines(
+            x=T_0_p,
+            ymin=0,
+            ymax=1,
+            colors="b",
+            linestyle="dashed",
+            label="T_0={} ".format(T_0_p),
+        )
+        ax.vlines(
+            x=T_1_p,
+            ymin=0,
+            ymax=1,
+            colors="r",
+            linestyle="dashed",
+            label="T_1={} ".format(T_1_p),
+        )
+        plt.title(
+            "For patient={} and treatement tt={}. Event (=1) = {} % & Treatement (=1) ={} %".format(
+                patient, tt_p, self.perc_event, self.perc_treatement
+            )
+        )
+        plt.legend()
+        plt.close()
+        return fig
+
+
+# v1
+class SimulationNew:
+
+    def __init__(self, params_simu):
+
+        n_samples = params_simu['n_samples']
+        n_features = params_simu['n_features']
+        beta = params_simu['beta']
+        alpha = params_simu['alpha']
+        lamb = params_simu['lamb']
+        kappa_cens = params_simu['kappa']
+        coef_tt = params_simu['coef_tt']
+        rho = params_simu['rho']
+
+        wd_para = params_simu['wd_param']
+
+        """[summary]
+        Simulation des données de survie causales. Nous controlons la distance de wasserstein entre les groupes traité/non traité
+        et le taux de censure.
+
+        Args:
+            n_samples ([integer]): [data size]
+            n_features ([integer]): [number of columns/features]
+            beta ([float]): [c'est le paramètre d'influence linéraire des colonnes]
+            alpha ([float]): [description]
+            lamb ([float]): [description]
+            kappa_cens ([float]): [description]
+            rho (float, optional): [description]. Defaults to 0.0.
+            scheme (str, optional): [description]. Defaults to 'linear'.
+            wd_para (int, optional): [description]. Defaults to 5.
+        """
+
+        self.n_features = n_features
+        """if len(beta) != n_features:
+            print("Error: n_features != len(beta) ")"""
+
+        # Simulation of baseline covariates
+        cov = toeplitz(rho ** np.arange(0, self.n_features))
+        self.cov = cov
+
+        # multivariate normal
+        self.X = multivariate_normal(
+            np.zeros(self.n_features), cov, size=n_samples)
+        # uniformal distribution
+        #self.X = np.random.uniform(0, 1, size=(n_samples, n_features))
+
+        self.n_samples = n_samples
+        self.beta = beta
+        self.alpha = alpha
+        self.lamb = lamb
+        self.kappa_cens = kappa_cens
+        self.coef_tt = coef_tt  # coef of treatement
+        self.scheme = params_simu['scheme']
+        self.scheme_function = params_simu['scheme'].get_scheme_function()
+        self.sheme_type = params_simu['scheme'].get_scheme_type()
+        self.wd_para = wd_para
+        self.Xbeta = self.X.dot(self.beta)
+
+        self.path_data = params_simu["path_data"]
+
+    # True Survival function
+    def S_p(self, x, tt, t, patient):
+        c_tt = self.coef_tt * tt
+
+        if self.sheme_type == 'linear':
+            x_beta_p = x.dot(self.beta)[patient]
+            return np.exp(-((self.lamb * t) ** self.alpha) * np.exp(x_beta_p + c_tt))
+        else:
+            sh_z = self.scheme_function(x)[patient] + c_tt
+            return np.exp(-((self.lamb * t) ** self.alpha) * np.exp(sh_z))
+
+    """def S(self, xbeta_p, tt_p, t):  # Agathe : pourquoi X apparait et pas Xbeta ?
+        c_tt = self.coef_tt * tt_p  # coef_tt : coef de traitement
+
+        if self.scheme == 'linear':
+            return np.exp(-((self.lamb * t) ** self.alpha) * np.exp(xbeta_p + c_tt))
+        else:
+            sh_z = self.scheme_function(self.X) + c_tt
+            return np.exp(-((self.lamb * t) ** self.alpha) * np.exp(sh_z))
+
+    def S_1(self, xbeta_p, t):
+        return self.S(xbeta_p, 1, t)
+
+    def S_0(self, xbeta_p, t):
+        return self.S(xbeta_p, 0, t)"""
+
+    # Simulation of times to event according to a Weibull-Cox model
+    def simulation_T(self, tt):
+        log_u = np.log(np.random.uniform(0, 1, self.n_samples))
+        U = np.log(-log_u)
+        if self.sheme_type == 'linear':
+            def sh_tt(tt):
+                return self.X.dot(self.beta) + self.coef_tt * tt
+        else:
+            def sh_tt(tt):
+                return self.scheme_function(self.X) + self.coef_tt * tt
+
+        log_T_f, log_T_cf = 1.0 / self.alpha * \
+            (U - sh_tt(tt)), 1.0 / self.alpha * (U - sh_tt(1-tt))
+
+        T_f = np.exp(log_T_f)/self.lamb
+        T_cf = np.exp(log_T_cf)/self.lamb
+        return T_f, T_cf
+
+    # Simulation of times to event according an exponential distribution
+    def simulation_C(self, lamb_c):
+        log_u = np.log(np.random.uniform(0, 1, self.n_samples))
+        return -log_u / lamb_c
+
+    def simulation_surv(self):
+        # treatment simulation
+        idx = np.arange(self.n_features)
+        params_tt = (-1) ** idx * np.exp(-idx / 10.)
+
+        p_tt = sigmoid(self.X.dot(params_tt))
+        tt = binomial(1, p_tt)  # treatment
+        # to modify tt to have 30% of patients with treatment
+        #tt[tt == 0] = np.random.binomial(1, 0.7, np.sum(tt == 0))
+
+        for j in range(self.n_features):
+            self.X[:, j] -= self.wd_para/2 * tt
+            self.X[:, j] += self.wd_para/2 * (1-tt)
+
+        # transform X distribution : normalisation [-1,1]
+        with_normalization = False
+        if with_normalization:
+            self.X = (self.X - np.min(self.X)) / \
+                (np.max(self.X))  # - np.min(self.X))
+        # self.X = (self.X) / (np.max(self.X))  # - np.min(self.X))
+
+        # update Xbeta
+        self.Xbeta = self.X.dot(self.beta)
+
+        # simulation of factual and counterfactual times to event
+        #T_f = self.simulation_T(tt)
+        #T_cf = self.simulation_T(1-tt)
+        T_f, T_cf = self.simulation_T(tt)
+
+        # definition of T1 and T0 (it matches the factual and counterfactual times to event)
+        T_1 = T_f*tt + T_cf * (1-tt)
+        T_0 = T_f*(1-tt) + T_cf * tt
+
+        mean_T_f = np.mean(T_f)
+
+        # simulation of censoring
+        C = self.simulation_C(1/(self.kappa_cens * mean_T_f))
+
+        # definition of observations
+        T_f_cens = np.minimum(T_f, C)
+        event = (T_f <= C) * 1
+
+        # transform treatment specific covariates in tensor and compute the Wasserstein distance
+        mask_1, mask_0 = (tt == 1), (tt == 0)
+        X_tesnor = torch.tensor(self.X).float()
+        x_1 = X_tesnor[mask_1]
+        x_0 = X_tesnor[mask_0]
+        m = max(x_0.shape, x_1.shape)
+        z0 = torch.zeros(m)
+        m0 = x_0.shape[0]
+        z0[:m0, ] = x_0
+        z1 = torch.zeros(m)
+        m1 = x_1.shape[0]
+        z1[:m1, ] = x_1
+        wd = SinkhornDistance(eps=0.001, max_iter=100,
+                              reduction=None)(z0, z1).item()
+
+        # data_frame construction
+        colmns = ["X" + str(j) for j in range(1, self.n_features + 1)]
+        data_sim = pd.DataFrame(data=self.X, columns=colmns)
+
+        data_sim["tt"] = tt
+        data_sim["T_f_cens"] = T_f_cens
+        data_sim["event"] = event
+        data_sim["T_1"] = T_1
+        data_sim["T_0"] = T_0
+
+        data_sim["T_f"] = T_f
+        data_sim["T_cf"] = T_cf
+
+        data_sim["Xbeta"] = self.Xbeta
+        self.data_sim = data_sim
+
+        # observed censoring, treatment proportions
+        self.perc_treatement = int((data_sim["tt"].mean() * 100))
+        self.perc_event = int(data_sim["event"].mean() * 100)
+        # Wasserstein distances
+        print("WD = ", wd)
+        print(f"tt = 1 : {self.perc_treatement} % ")
+        print(f"event = 1 : {self.perc_event} %")
+        print('Scheme : ', self.sheme_type)
+        print('Wd_para : ', self.wd_para)
+        self.wd = wd
+        data_sim.to_csv(self.path_data + ".csv", index=False, header=True)
+
+        return data_sim
+
+    # Distribution plots for tt=0/1
+
+    def plot_dist(self):
+
+        colmns = ["X" + str(j) for j in range(1, self.n_features + 1)] + ["tt"]
+        return sns.pairplot(self.data_sim[colmns], hue="tt", diag_kind="hist", height=6)
+
+    # True S_O and S_1 for a patient
+    def plot_surv_true(self, patient=1):
+
+        t_max = max(self.data_sim["T_f"])
+        times = np.linspace(0, t_max, 100)
+
+        # get tau
+        """tau0 = quantile(times, self.S_p(self.X, 0, times, patient), 0.05)
+        tau1 = quantile(times, self.S_p(self.X, 1, times, patient), 0.05)
+        tau_min = max(tau0, tau1)
+        
+        time_ = np.linspace(0, tau_min, 100)"""
+
+        time_ = times
+
+        T_0_p = self.data_sim["T_0"].values[patient].round(2)
+        T_1_p = self.data_sim["T_1"].values[patient].round(2)
+        tt_p = self.data_sim["tt"].values[patient]
+
+        self.S_0_true = self.S_p(self.X, 0, time_, patient)
+
+        self.S_1_true = self.S_p(self.X, 1, time_, patient)
+
+        fig = plt.figure(figsize=(18, 10))
+        ax = fig.add_subplot(111)
+        ax.plot(
+            time_,
+            self.S_0_true,
+            label="S_true for tt=0",
+            marker="o",
+            markersize=1,
+            color="b",
+        )
+        ax.plot(
+            time_,
+            self.S_1_true,
+            label="S_true for tt=1",
+            marker="o",
+            markersize=1,
+            color="r",
+        )
+        ax.vlines(
+            x=T_0_p,
+            ymin=0,
+            ymax=1,
+            colors="b",
+            linestyle="dashed",
+            label="T_0={} ".format(T_0_p),
+        )
+        ax.vlines(
+            x=T_1_p,
+            ymin=0,
+            ymax=1,
+            colors="r",
+            linestyle="dashed",
+            label="T_1={} ".format(T_1_p),
+        )
+        plt.title(
+            "For patient={} and treatement tt={}. Event (=1) = {} % & Treatement (=1) ={} %".format(
+                patient, tt_p, self.perc_event, self.perc_treatement
+            )
+        )
+        plt.legend()
+        plt.close()
+        return fig
+
+
+# semi-synthetic datasets : choice : is_tcga,is_support,is_metabric
+class Simulation_from_data:
+
+    def __init__(self, params_simu, is_tcga=False, is_support=False, is_metabric=False):
+        self.params_simu = params_simu
+        self.path_data = params_simu["path_data"]
+        if is_tcga:
+            self.X, self.tt = load_tcga(self.path_data)
+        elif is_support:
+            self.X, self.tt = load_support(self.path_data)
+        elif is_metabric:
+            self.X, self.tt = load_metabric(self.path_data)
+        self.X = self.X.values
+        # X min max normalization
+        self.X = (self.X - self.X.min(axis=0)) / \
+            (self.X.max(axis=0) - self.X.min(axis=0))
+
+        self.n_samples, self.n_features = self.X.shape
+
+        self.beta = params_simu["beta"]
+        self.alpha = params_simu["alpha"]
+        self.lamb = params_simu["lamb"]
+        self.kappa_cens = params_simu["kappa"]
+        self.coef_tt = params_simu["coef_tt"]
+        self.scheme = params_simu["scheme"]
+        self.Xbeta = self.X.dot(self.beta)
+
+        self.scheme_function = params_simu['scheme'].get_scheme_function()
+        self.sheme_type = params_simu['scheme'].get_scheme_type()
+
+    # True Survival function
+
+    def S_p(self, x, tt, t, patient):
+        c_tt = self.coef_tt * tt
+
+        if self.sheme_type == 'linear':
+            x_beta_p = x.dot(self.beta)[patient]
+            return np.exp(-((self.lamb * t) ** self.alpha) * np.exp(x_beta_p + c_tt))
+        else:
+            sh_z = self.scheme_function(x)[patient] + c_tt
+            return np.exp(-((self.lamb * t) ** self.alpha) * np.exp(sh_z))
+
+    # Simulation of times to event according to a Weibull-Cox model
+
+    def simulation_T(self, tt):
+        log_u = np.log(np.random.uniform(0, 1, self.n_samples))
+        U = np.log(-log_u)
+        if self.sheme_type == 'linear':
+            def sh_tt(tt):
+                return self.X.dot(self.beta) + self.coef_tt * tt
+        else:
+            def sh_tt(tt):
+                return self.scheme_function(self.X) + self.coef_tt * tt
+
+        log_T_f, log_T_cf = 1.0 / self.alpha * \
+            (U - sh_tt(tt)), 1.0 / self.alpha * (U - sh_tt(1-tt))
+
+        T_f = np.exp(log_T_f)/self.lamb
+        T_cf = np.exp(log_T_cf)/self.lamb
+        return T_f, T_cf
+
+    # Simulation of times to event according an exponential distribution
+    def simulation_C(self, lamb_c):
+        log_u = np.log(np.random.uniform(0, 1, self.n_samples))
+        return -log_u / lamb_c
+
+    def simulation_surv(self):
+
+        tt = self.tt
+
+        # update Xbeta
+        self.Xbeta = self.X.dot(self.beta)
+
+        # simulation of factual and counterfactual times to event
+        #T_f = self.simulation_T(tt)
+        #T_cf = self.simulation_T(1-tt)
+        T_f, T_cf = self.simulation_T(tt)
+
+        # definition of T1 and T0 (it matches the factual and counterfactual times to event)
+        T_1 = T_f*tt + T_cf * (1-tt)
+        T_0 = T_f*(1-tt) + T_cf * tt
+
+        mean_T_f = np.mean(T_f)
+
+        # simulation of censoring
+        C = self.simulation_C(1/(self.kappa_cens * mean_T_f))
+
+        # definition of observations
+        T_f_cens = np.minimum(T_f, C)
+        event = (T_f <= C) * 1
+
+        # transform treatment specific covariates in tensor and compute the Wasserstein distance
+        mask_1, mask_0 = (tt == 1), (tt == 0)
+        X_tesnor = torch.tensor(self.X).float()
+        x_1 = X_tesnor[mask_1]
+        x_0 = X_tesnor[mask_0]
+        m = max(x_0.shape, x_1.shape)
+        z0 = torch.zeros(m)
+        m0 = x_0.shape[0]
+        z0[:m0, ] = x_0
+        z1 = torch.zeros(m)
+        m1 = x_1.shape[0]
+        z1[:m1, ] = x_1
+        wd = SinkhornDistance(eps=0.001, max_iter=100,
+                              reduction=None)(z0, z1).item()
+
+        # data_frame construction
+        colmns = ["X" + str(j) for j in range(1, self.n_features + 1)]
+        data_sim = pd.DataFrame(data=self.X, columns=colmns)
+
+        data_sim["tt"] = tt
+        data_sim["T_f_cens"] = T_f_cens
+        data_sim["event"] = event
+        data_sim["T_1"] = T_1
+        data_sim["T_0"] = T_0
+
+        data_sim["T_f"] = T_f
+        data_sim["T_cf"] = T_cf
+
+        data_sim["Xbeta"] = self.Xbeta
+        self.data_sim = data_sim
+
+        # observed censoring, treatment proportions
+        self.perc_treatement = int((data_sim["tt"].mean() * 100))
+        self.perc_event = int(data_sim["event"].mean() * 100)
+        # Wasserstein distances
+        print("WD = ", wd)
+        print(f"tt = 1 : {self.perc_treatement} % ")
+        print(f"event = 1 : {self.perc_event} %")
+        print('Scheme : ', self.sheme_type)
+        self.wd = wd
+        data_sim.to_csv(self.path_data + "_simu.csv", index=False, header=True)
+
+        return data_sim
+
+
+class Scheme:
+    """
+    input:
+        type_s: 'linear' or 'nonlinear'
+        function: function to be used
+    """
+
+    def __init__(self, type_s, function=None):
+        self.type = type_s
+        self.function = function  #  fonction de x , args*
+
+    def get_scheme_type(self):
+        return self.type
+
+    def get_scheme_function(self):
+        return self.function
+
+
+# log with neptune.ai
+class Neptune:
+    def __init__(self, experiment_name):
+        self.project = "SurvCaus/RUNS"
+        self.api_token = "eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vYXBwLm5lcHR1bmUuYWkiLCJhcGlfdXJsIjoiaHR0cHM6Ly9hcHAubmVwdHVuZS5haSIsImFwaV9rZXkiOiI5NTllZGVjNy1jMWVmLTRjNzktYTIyNi0yM2JiNjIwZDkyZjgifQ=="
+        self.experiment_name = experiment_name
+        self.experiment = None
+
+        self.num_runs = 0
+        self.list_runs = []
+        self.p_survcaus_best = None
+        self.p_bart_best = None
+
+        self.p_survcaus_best_list = []
+        self.p_bart_best_list = []
+
+        self.data_sim = None
+        self.list_models = ["SurvCaus", "SurvCaus_0", 'CoxPH', 'BART']
+        self.list_EV = []
+        self.list_bilan = []
+        self.wd_list = []
+
+    def create_experiment(self):
+        # create experiment
+        self.experiment = neptune.init(
+            project=self.project, api_token=self.api_token)
+        # increase number of runs
+        #self.num_runs += 1
+        # add run to list
+        self.list_runs.append(self.experiment)
+        return self.experiment
+
+    def set_p_survcaus_best(self, p_survcaus_best):
+        self.p_survcaus_best = p_survcaus_best
+        self.p_survcaus_best_list.append(p_survcaus_best)
+
+    def set_p_bart_best(self, p_bart_best):
+        self.p_bart_best = p_bart_best
+        self.p_bart_best_list.append(p_bart_best)
+
+    def send_data(self, df, name, num_run):
+        df.to_csv("./data_exp/"+name+"_"+str(num_run)+".csv")
+        self.experiment["data_exp/"+name+"_"+str(num_run)].upload(
+            File("./data_exp/"+name+"_"+str(num_run)+".csv"))
+
+    def send_dict(self, dic, name, num_run):
+        dict_to_send = dic.copy()
+        if 'scheme' in dict_to_send:
+            del dict_to_send['scheme']
+        if 'beta' in dict_to_send:
+            del dict_to_send['beta']
+        with open("./param_exp/"+name+"_"+str(num_run)+".json", 'w') as f:
+            json.dump(dict_to_send, f)
+        self.experiment["param_exp/"+name+"_"+str(num_run)].upload(
+            File("./param_exp/"+name+"_"+str(num_run)+".json"))
+
+    def send_param(self, param, name, num_run):
+        param.to_csv("./param_exp/"+name+"_"+str(num_run)+".csv")
+        self.experiment["param_exp/"+name+"_"+str(num_run)].upload(
+            File("./param_exp/"+name+"_"+str(num_run)+".csv"))
+
+    def send_plot(self, fig, name, num_run):
+        fig.savefig("./plots_exp/"+name+"_"+str(num_run)+".png")
+        self.experiment["plots_exp/"+name+"_"+str(num_run)].upload(
+            File("./plots_exp/"+name+"_"+str(num_run)+".png"))
+
+    # 'Simulation'
+
+    def run_simulation(self, p_sim):
+        self.simu = SimulationNew(p_sim)
+
+        data = self.simu.simulation_surv()
+        self.data_sim = data
+        self.p_sim = p_sim
+        # TSNE
+        """ x = data.iloc[:, :p_sim['n_features']]
+        tsne = TSNE(n_components=2, verbose=1, random_state=123)
+        z = tsne.fit_transform(x)
+        d = pd.DataFrame()
+        d["tt"] = data[['tt']].values.squeeze()
+        d["comp-1"] = z[:, 0]
+        d["comp-2"] = z[:, 1]
+
+        fig = plt.figure()
+        sns.scatterplot(x="comp-1", y="comp-2", hue=d.tt.tolist(),
+                    palette=sns.color_palette("hls", 2),
+                    data=d).set(title="Sampled data T-SNE projection")
+        plt.close()
+        # send to neptune
+        self.send_plot(fig, "TSNE",self.num_runs)"""
+
+        self.send_data(data, "data_sim", self.num_runs)
+
+        surv_true = self.simu.plot_surv_true(patient=0)
+        self.send_plot(surv_true, "surv_true", self.num_runs)
+
+        self.num_runs += 1
+        self.get_wd_dist()
+        return data
+
+    def get_simulation_data(self):
+        return self.data_sim
+
+    # Tunning Survcaus
+
+    def run_tunning_survcaus(self, n_trials):
+        self.tunning = Tunning(self.p_sim)
+        p_survcaus_best = self.tunning.get_best_hyperparameter_survcaus(
+            n_trials=n_trials)
+        p_survcaus_best['epochs'] = 40
+        p_survcaus_best['batch_size'] = 256
+        p_survcaus_best['patience'] = 4
+        self.p_survcaus_best = p_survcaus_best
+        self.p_survcaus_best_list.append(p_survcaus_best)
+        return p_survcaus_best
+
+    def run_tunning_bart(self, n_trials):
+        p_bart_best = self.tunning.get_best_hyperparameter_bart(
+            n_trials=n_trials)
+        self.set_p_bart_best(p_bart_best)
+        return p_bart_best
+
+    def get_evaluation(self):
+        self.Ev = Evaluation(self.p_sim, self.p_survcaus_best)
+        self.list_EV.append(self.Ev)
+        return self.Ev
+
+    def launch_benchmark(self):
+        Ev = self.get_evaluation()
+        Ev.All_Results(list_models=self.list_models,
+                       is_train=False, params_bart=self.p_bart_best)
+
+        self.bilan_csv = Ev.bilan_benchmark
+        self.list_bilan.append(self.bilan_csv)
+        path_bilan = "./bilan_exp/"+self.experiment_name + \
+            "_exp"+str(self.num_runs)+"wd_"+str(self.wd)+".csv"
+        self.bilan_csv.to_csv(path_bilan)
+
+        self.experiment["bilan_exp/"+self.experiment_name+"_" +
+                        str(self.num_runs)+"wd_"+str(self.wd)].upload(File(path_bilan))
+        # box plots
+        self.box_plot_cate = Ev.box_plot_cate
+        path_box_plot_cate = "./box_plot_exp/"+self.experiment_name + \
+            "_"+str(self.num_runs)+"wd_"+str(self.wd)+"_box_plot_cate.png"
+        self.box_plot_cate.savefig(path_box_plot_cate)
+        self.experiment["box_plot_exp/cate_"+self.experiment_name+"_exp" +
+                        str(self.num_runs)+"wd_"+str(self.wd)].upload(File(path_box_plot_cate))
+        self.box_plot_pehe = Ev.box_plot_pehe
+        path_box_plot_pehe = "./box_plot_exp/"+self.experiment_name + \
+            "_"+str(self.num_runs)+"wd_"+str(self.wd)+"_box_plot_pehe.png"
+        self.box_plot_pehe.savefig(path_box_plot_pehe)
+        self.experiment["box_plot_exp/pehe_"+self.experiment_name+"_exp" +
+                        str(self.num_runs)+"wd_"+str(self.wd)].upload(File(path_box_plot_pehe))
+
+        self.box_plot_surv0 = Ev.box_plot_surv0
+        path_box_plot_surv0 = "./box_plot_exp/"+self.experiment_name + \
+            "_"+str(self.num_runs)+"wd_"+str(self.wd)+"_box_plot_surv0.png"
+        self.box_plot_surv0.savefig(path_box_plot_surv0)
+        self.experiment["box_plot_exp/surv0_"+self.experiment_name+"_exp" +
+                        str(self.num_runs)+"wd_"+str(self.wd)].upload(File(path_box_plot_surv0))
+        self.box_plot_surv1 = Ev.box_plot_surv1
+        path_box_plot_surv1 = "./box_plot_exp/"+self.experiment_name + \
+            "_"+str(self.num_runs)+"wd_"+str(self.wd)+"_box_plot_surv1.png"
+        self.box_plot_surv1.savefig(path_box_plot_surv1)
+        self.experiment["box_plot_exp/surv1_"+self.experiment_name+"_exp" +
+                        str(self.num_runs)+"wd_"+str(self.wd)].upload(File(path_box_plot_surv1))
+
+        self.box_plot_FSM = Ev.box_plot_FSM
+        path_box_plot_FSM = "./box_plot_exp/"+self.experiment_name + \
+            "_"+str(self.num_runs)+"wd_"+str(self.wd)+"_box_plot_FSM.png"
+        self.box_plot_FSM.savefig(path_box_plot_FSM)
+        self.experiment["box_plot_exp/FSM_"+self.experiment_name+"_exp" +
+                        str(self.num_runs)+"wd_"+str(self.wd)].upload(File(path_box_plot_FSM))
+
+    def get_plots_patients(self, patient=0):
+        for model_name in self.list_models[1:]:
+            fig_surv, fig_cate = plots(
+                patient, self.Ev.d_list_models, model_name)
+            # save plots
+            path_fig_surv = "./plots_exp/"+self.experiment_name+"_" + \
+                str(self.num_runs)+"wd_"+str(self.wd) + \
+                "_"+model_name+"_surv.png"
+            fig_surv.savefig(path_fig_surv)
+
+            path_fig_cate = "./plots_exp/"+self.experiment_name+"_" + \
+                str(self.num_runs)+"wd_"+str(self.wd) + \
+                "_"+model_name+"_cate.png"
+            fig_cate.savefig(path_fig_cate)
+
+            self.experiment["plots_exp/surv_"+model_name+"_exp" +
+                            str(self.num_runs)+"wd_"+str(self.wd)].upload(File(path_fig_surv))
+
+            self.experiment["plots_exp/cate_"+model_name+"_exp" +
+                            str(self.num_runs)+"wd_"+str(self.wd)].upload(File(path_fig_cate))
+
+    def get_wd_dist(self):
+        self.wd = int(self.simu.wd)
+        self.wd_list.append(self.wd)
+
+    # concatenate list bilan csv in one csv with index = wd
+
+    def concatenate_list_bilan(self):
+        wd_index = self.get_wd_dist()
+        df_list = [pd.read_csv(f) for f in self.list_bilan]
+        df_concat = pd.concat(df_list, ignore_index=True)
+        # add index
+        df_concat.insert(0, 'wd', wd_index)
+        df_concat.to_csv("./bilan_exp/all_bilan_" +
+                         self.experiment_name+"_"+str(self.num_runs)+".csv")
+        self.experiment["bilan_exp/all_bilan_"+self.experiment_name+"_"+str(self.num_runs)].upload(
+            File("./bilan_exp/all_bilan_"+self.experiment_name+"_"+str(self.num_runs)+".csv"))
+
+    # kill neptune experiment
+
+    def kill_experiment(self):
+        self.experiment.stop()
