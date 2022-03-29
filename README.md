@@ -1,4 +1,4 @@
-![alt text](https://github.com/abraich/pycaus/blob/4e56c0dad293c457bb34fb6c2ab39a2353a4ce4e/pycaus.png)
+![alt text](https://github.com/abraich/pycaus/blob/main/pycaus.png)
 
 
 
