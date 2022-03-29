@@ -1,3 +1,8 @@
+![alt text](https://github.com/abraich/pycaus/blob/4e56c0dad293c457bb34fb6c2ab39a2353a4ce4e/pycaus.png)
+
+
+
+
 
 **pycaus** is a python package for causal survival analysis and counterfactual classaification predection with [PyTorch](https://pytorch.org), built on the [torchtuples](https://github.com/havakv/torchtuples) package for training PyTorch models. 
 
