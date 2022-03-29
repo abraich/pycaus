@@ -1,4 +1,8 @@
-![alt text](https://github.com/abraich/pycaus/blob/main/pycaus.png)
+
+<center>
+    <img src="https://github.com/abraich/pycaus/blob/main/pycaus.png">
+</center>
+
 
 
 
