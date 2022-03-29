@@ -1,7 +1,7 @@
+<p align="center">
+  <img width="460" height="300" src="https://github.com/abraich/pycaus/blob/main/pycaus.png">
+</p>
 
-<center>
-    <img src="https://github.com/abraich/pycaus/blob/main/pycaus.png">
-</center>
 
 
 
