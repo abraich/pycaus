@@ -1,6 +1,5 @@
 
-from apps.surv_files.utils import *
-from pycox.models.loss import NLLLogistiHazardLoss
+from survcaus.utils import *
 
 
 class WassLoss(nn.Module):
@@ -96,11 +95,10 @@ class Loss(nn.Module):
         self.alpha = alpha
         self.loss_surv = NLLPMFLoss()  # NewLoss()# NLLLogistiHazardLoss()
         self.loss_wass = WassLoss()  # IPM
-        
 
     def forward(self, phi, psi_t, idx_durations, events):
         events = events.clone().detach().float()  # torch.tensor(events).float()
         # Survival loss.
         loss_surv = self.loss_surv(phi, idx_durations, events)
         loss_wass = self.loss_wass(psi_t)  # Wasserstein Loss
-        return self.beta*loss_surv + self.alpha/ phi.shape[0] * loss_wass  #
+        return self.beta*loss_surv + self.alpha / phi.shape[0] * loss_wass  #
