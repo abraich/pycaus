@@ -14,6 +14,3 @@ numba
 optuna
 pysurvival
 lifelines
-tableone
-pygsheets # sheet google
-neptune

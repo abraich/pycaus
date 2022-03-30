@@ -75,6 +75,8 @@ def sigmoid(x):
     return out
 
 #  Wasserstein distance
+
+
 class SinkhornDistance(nn.Module):
     """[summary]
 
