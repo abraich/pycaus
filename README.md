@@ -29,10 +29,8 @@ pip install pycaus
 
 
 # Simulated Datasets
-A collection of datasets are available through the `pycox.datasets` module.
-For example, the following code will download the `metabric` dataset and load it in the form of a pandas dataframe
+
 ```python
-from pycox import 
 ```
 
 
