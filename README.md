@@ -10,7 +10,9 @@
 
 **pycaus** is a python package for causal survival analysis and counterfactual classaification predection with [PyTorch](https://pytorch.org), built on the [torchtuples](https://github.com/havakv/torchtuples) package for training PyTorch models. 
 
-The package contains implementations of 
+**Note:** *This package is still in its early stages of development..* 
+
+The package contains implementations of ..
 # Get Started
 
 To get started you first need to install [PyTorch](https://pytorch.org/get-started/locally/).
@@ -37,7 +39,7 @@ from pycox import
 
 # Installation
 
-**Note:** *This package is still in its early stages of development, so please don't hesitate to report any problems you may experience.* 
+
 
 The package only works for python 3.6+.
 
