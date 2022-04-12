@@ -154,10 +154,7 @@ def KL(a, b):
 
 
 
-def std_diff_metric(x, y):
-    x = np.asarray(x, dtype=np.float)
-    y = np.asarray(y, dtype=np.float)
-    return np.std(x - y)
+def std_diff_
 def reduce_mem_usage(df):
 
     start_mem = df.memory_usage().sum() / 1024**2

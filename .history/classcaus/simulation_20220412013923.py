@@ -42,8 +42,8 @@ class Simulation:
         tt = binomial(1, p_tt)  # treatment
 
         for j in range(self.n_features):
-            self.X[:, j] -= self.wd_para/2 * tt 
-            self.X[:, j] += self.wd_para/2 * (1-tt) 
+            self.X[:, j] -= self.wd_para/2 * tt * params_tt[j]
+            self.X[:, j] += self.wd_para/2 * (1-tt) * (1-params_tt[j])
             
         # transform treatment specific covariates in tensor and compute the Wasserstein distance
         def get_wd(tt,X) :
@@ -66,13 +66,11 @@ class Simulation:
             
             
         # normalize 
-        #self.X = self.X / np.linalg.norm(self.X, axis=1)[:, None]
+        self.X = self.X / np.linalg.norm(self.X, axis=1)[:, None]
         
         # pi (x,t) =P(Y=1|X=x,T=t)
-        s_f = self.X.dot(self.beta) + self.coef_tt * tt
-        s_cf = self.X.dot(self.beta) + self.coef_tt * (1-tt)
-        pi_f = sigmoid(s_f)
-        pi_cf = sigmoid(s_cf)
+        pi_f = sigmoid(self.X.dot(self.beta) + self.coef_tt * tt )
+        pi_cf = sigmoid(self.X.dot(self.beta) + self.coef_tt * (1-tt))
         Y_f = binomial(1, pi_f)
         Y_cf = binomial(1, pi_cf)
         Y_0 = (1-tt) * Y_f + tt * Y_cf

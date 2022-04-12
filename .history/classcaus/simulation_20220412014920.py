@@ -66,13 +66,13 @@ class Simulation:
             
             
         # normalize 
-        #self.X = self.X / np.linalg.norm(self.X, axis=1)[:, None]
+        self.X = self.X / np.linalg.norm(self.X, axis=1)[:, None]
         
         # pi (x,t) =P(Y=1|X=x,T=t)
         s_f = self.X.dot(self.beta) + self.coef_tt * tt
         s_cf = self.X.dot(self.beta) + self.coef_tt * (1-tt)
-        pi_f = sigmoid(s_f)
-        pi_cf = sigmoid(s_cf)
+        pi_f = sigmoid(s_f/np.linalg.norm(s_f))
+        pi_cf = sigmoid(s_cf/np.linalg.norm(s_cf))
         Y_f = binomial(1, pi_f)
         Y_cf = binomial(1, pi_cf)
         Y_0 = (1-tt) * Y_f + tt * Y_cf

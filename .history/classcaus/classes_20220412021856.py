@@ -632,14 +632,12 @@ class BenchmarkClassif():
         auc_1 = metrics.roc_auc_score(y_test_1, p_pred_1)
         kl_0 = KL(p_test_0, p_pred_0)
         kl_1 = KL(p_test_1, p_pred_1)
-        std_diff_0 = std_diff_metric(p_test_0, p_pred_0)
-        std_diff_1 = std_diff_metric(p_test_1, p_pred_1)
         d_0 = {'acc': acc_0, 'f1': f_1_0, 'auc': auc_0,
-               'cf_m': cfm_m_0, 'pehe': pehe, 'mae': mae, 'kl': kl_0,'std_diff': std_diff_0}
+               'cf_m': cfm_m_0, 'pehe': pehe, 'mae': mae, 'kl': kl_0}
         d_1 = {'acc': acc_1, 'f1': f_1_1, 'auc': auc_1,
-               'cf_m': cfm_m_1, 'pehe': pehe, 'mae': mae, 'kl': kl_1,'std_diff': std_diff_1}
-        #print(f' Report for tt = 0 : \n {d_0}')
-        #print(f' Report for tt = 1 : \n {d_1}')
+               'cf_m': cfm_m_1, 'pehe': pehe, 'mae': mae, 'kl': kl_1}
+        print(f' Report for tt = 0 : \n {d_0}')
+        print(f' Report for tt = 1 : \n {d_1}')
         # roc curve
         fig_roc = plt.figure(figsize=(14, 10), dpi=120)
         fpr_1, tpr_1, thresholds = metrics.roc_curve(y_test_1, p_pred_1)

@@ -262,9 +262,8 @@ class ClassifCaus(nn.Module):
         f1_s = metrics.f1_score(y_test, y_pred_t)
         auc = metrics.roc_auc_score(y_test, p_pred_t)
         kl = KL(p_test, p_pred_t)
-        std_diff =std_diff_metric(p_test, p_pred_t)
         report = classification_report(y_test, y_pred_t)
-        return acc, cf_m, f1_s, auc, kl, p_pred_t, report, std_diff
+        return acc, cf_m, f1_s, auc, kl, p_pred_t, report
 
     def eval_all_test(self, N):
         """
@@ -277,11 +276,10 @@ class ClassifCaus(nn.Module):
         y_test_1 = torch.from_numpy(self.data.counter_test[:, 2]).float()
         p_test_0 = torch.from_numpy(self.data.counter_test[:, 3]).float()
         p_test_1 = torch.from_numpy(self.data.counter_test[:, 4]).float()
-        acc_0, cfm_m_0, f_1_0, auc_0, kl_0, p_pred_0, report_0 , std_diff_0= self.pred_t(
+        acc_0, cfm_m_0, f_1_0, auc_0, kl_0, p_pred_0, report_0 = self.pred_t(
             self.data.x_test, 0, y_test_0, p_test_0)
-        acc_1, cfm_m_1, f_1_1, auc_1, kl_1, p_pred_1, report_1, std_diff_1 = self.pred_t(
+        acc_1, cfm_m_1, f_1_1, auc_1, kl_1, p_pred_1, report_1 = self.pred_t(
             self.data.x_test, 1, y_test_1, p_test_1)
-        
         #
         p_pred_0 = np.asarray(p_pred_0, dtype=np.float)
         p_pred_1 = np.asarray(p_pred_1, dtype=np.float)
@@ -342,10 +340,9 @@ class ClassifCaus(nn.Module):
         pehe = np.sqrt(metrics.mean_squared_error(cate_true, cate_pred))
         mae = metrics.mean_absolute_error(cate_true, cate_pred)
         d_0 = {'acc': acc_0, 'f1': f_1_0, 'auc': auc_0,
-               'cf_m': cfm_m_0, 'pehe': pehe, 'mae': mae, 'kl': kl_0, 'std_diff': std_diff_0}
+               'cf_m': cfm_m_0, 'pehe': pehe, 'mae': mae, 'kl': kl_0}
         d_1 = {'acc': acc_1, 'f1': f_1_1, 'auc': auc_1,
-               'cf_m': cfm_m_1, 'pehe': pehe, 'mae': mae, 'kl': kl_1, 'std_diff': std_diff_1}
-        
+               'cf_m': cfm_m_1, 'pehe': pehe, 'mae': mae, 'kl': kl_1}
 
         #print(f' Report for tt = 0 : \n {report_0}')
         #print(f' Report for tt = 1 : \n {report_1}')
@@ -482,16 +479,12 @@ class BenchmarkClassif():
         auc_1 = metrics.roc_auc_score(y_test_1, p_pred_1)
         kl_0 = KL(p_test_0, p_pred_0)
         kl_1 = KL(p_test_1, p_pred_1)
-        std_diff_0 = std_diff_metric(p_test_0, p_pred_0)
-
-        std_diff_1 = std_diff_metric(p_test_1, p_pred_1)
-
         d_0 = {'acc': acc_0, 'f1': f_1_0, 'auc': auc_0,
-               'cf_m': cfm_m_0, 'pehe': pehe, 'mae': mae, 'kl': kl_0, 'std_diff': std_diff_0}
+               'cf_m': cfm_m_0, 'pehe': pehe, 'mae': mae, 'kl': kl_0}
         d_1 = {'acc': acc_1, 'f1': f_1_1, 'auc': auc_1,
-               'cf_m': cfm_m_1, 'pehe': pehe, 'mae': mae, 'kl': kl_1, 'std_diff': std_diff_1}
-        #print(f' Report for tt = 0 : \n {d_0}')
-        #print(f' Report for tt = 1 : \n {d_1}')
+               'cf_m': cfm_m_1, 'pehe': pehe, 'mae': mae, 'kl': kl_1}
+        print(f' Report for tt = 0 : \n {d_0}')
+        print(f' Report for tt = 1 : \n {d_1}')
         # roc curve
         fig_roc = plt.figure(figsize=(14, 10), dpi=120)
         fpr_1, tpr_1, thresholds = metrics.roc_curve(y_test_1, p_pred_1)
@@ -541,8 +534,7 @@ class BenchmarkClassif():
 
             results[model_name] = {'acc_0': d_0['acc'], 'acc_1': d_1['acc'], 'f1_0': d_0['f1'], 'f1_1': d_1['f1'],
                                    'auc_0': d_0['auc'], 'auc_1': d_1['auc'],  'pehe': d_0['pehe'], 'mae': d_0['mae'],
-                                   'kl_0': d_0['kl'], 'kl_1': d_1['kl'], 'std_diff_0': d_0['std_diff'], 'std_diff_1': d_1['std_diff']}
-
+                                   'kl_0': d_0['kl'], 'kl_1': d_1['kl']}  # 'cfm_m_0': d_0['cf_m'],'cfm_m_1': d_1['cf_m'],
             print(f'Evaluation for model {model_name} done')
             d_all[model_name] = d_exp
 
@@ -632,14 +624,12 @@ class BenchmarkClassif():
         auc_1 = metrics.roc_auc_score(y_test_1, p_pred_1)
         kl_0 = KL(p_test_0, p_pred_0)
         kl_1 = KL(p_test_1, p_pred_1)
-        std_diff_0 = std_diff_metric(p_test_0, p_pred_0)
-        std_diff_1 = std_diff_metric(p_test_1, p_pred_1)
         d_0 = {'acc': acc_0, 'f1': f_1_0, 'auc': auc_0,
-               'cf_m': cfm_m_0, 'pehe': pehe, 'mae': mae, 'kl': kl_0,'std_diff': std_diff_0}
+               'cf_m': cfm_m_0, 'pehe': pehe, 'mae': mae, 'kl': kl_0}
         d_1 = {'acc': acc_1, 'f1': f_1_1, 'auc': auc_1,
-               'cf_m': cfm_m_1, 'pehe': pehe, 'mae': mae, 'kl': kl_1,'std_diff': std_diff_1}
-        #print(f' Report for tt = 0 : \n {d_0}')
-        #print(f' Report for tt = 1 : \n {d_1}')
+               'cf_m': cfm_m_1, 'pehe': pehe, 'mae': mae, 'kl': kl_1}
+        print(f' Report for tt = 0 : \n {d_0}')
+        print(f' Report for tt = 1 : \n {d_1}')
         # roc curve
         fig_roc = plt.figure(figsize=(14, 10), dpi=120)
         fpr_1, tpr_1, thresholds = metrics.roc_curve(y_test_1, p_pred_1)
