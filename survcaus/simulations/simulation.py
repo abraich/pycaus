@@ -1,5 +1,5 @@
 
-from survcaus.models.classes import *
+from models.classes import *
 from survcaus.utils import *
 #from sklearn.manifold import TSNE
 #import neptune.new as neptune
